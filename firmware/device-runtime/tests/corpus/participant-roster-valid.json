@@ -1,0 +1,1 @@
+{"participantId":"fuzz-participant","change":"joined","tracks":[{"trackId":"fuzz-audio","kind":"audio","sourceId":"fuzz-source","direction":"recvonly","codec":"opus","state":"active"}]}

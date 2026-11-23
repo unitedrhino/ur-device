@@ -1,0 +1,1 @@
+{"msgToken":"fuzz-execute","method":"toolCallExecute","sessionId":"fuzz-session","messageSeq":1,"data":{"respId":"fuzz-response","toolCallId":"fuzz-call","name":"set_local_display_theme","arguments":{"theme":"dark","theme":"light"},"isFrontend":true,"interactionType":"action","executionToken":"synthetic-fuzz-token","expiresAt":11000}}

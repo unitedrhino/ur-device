@@ -1,0 +1,12 @@
+// 文件说明：显式实时节目接收的固定浏览器资产，不授予摄像头、网络源或输出焦点。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// live_assets 返回构建期固定UTF-8源码；实际启用、格式自检和端点能力由原C++宿主负责。
+inline std::map<std::string, std::string> live_assets() {
+    return {{"/live-probe.js", @UR_LIVE_PROBE@}, {"/live-player.js", @UR_LIVE_PLAYER@},
+            {"/live-host.js", @UR_LIVE_HOST@}, {"/live-worklet.js", @UR_LIVE_WORKLET@},
+            {"/live-transform-worker.js", @UR_LIVE_TRANSFORM@}};
+}
+} // namespace ur::device

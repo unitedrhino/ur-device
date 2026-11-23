@@ -1,0 +1,20 @@
+{
+    "manufacturer": "espressif",
+    "type": "esp-sparkbot",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "esp-sparkbot",
+            "sdkconfig_append": [
+                "CONFIG_CAMERA_OV2640=y",
+                "CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
+                "CONFIG_CAMERA_OV2640_DVP_YUV422_240X240_25FPS=y",
+                "CONFIG_CAMERA_GC2145=y",
+                "CONFIG_CAMERA_GC2145_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
+                "CONFIG_CAMERA_GC2145_DVP_RGB565_BE_640X480_15FPS=y",
+                "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
+                "CONFIG_ESP_CONSOLE_UART_DEFAULT=n"
+            ]
+        }
+    ]
+}

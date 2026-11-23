@@ -1,0 +1,13 @@
+// 文件说明：独立视频通话界面在编译期嵌入，不按浏览器请求路径读取本地文件。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// video_assets返回视频界面的固定路径与UTF-8内容，与语音界面分别路由。
+inline std::map<std::string, std::string> video_assets() {
+    return {{"/index.html", @UR_VIDEO_HTML@},
+            {"/app.css", @UR_WEB_CSS@},
+            {"/app.js", @UR_VIDEO_JS@},
+            {"/call-worklet.js", @UR_CALL_WORKLET@}};
+}
+} // namespace ur::device

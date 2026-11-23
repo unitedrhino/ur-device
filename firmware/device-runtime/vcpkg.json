@@ -1,0 +1,6 @@
+{
+  "name": "ur-device-runtime",
+  "version-string": "0.1.0",
+  "builtin-baseline": "e06564091c10e0b042900800c9fd48aad7f00643",
+  "dependencies": ["mosquitto", "opus", "openssl", {"name": "curl", "default-features": false, "features": ["openssl"]}]
+}

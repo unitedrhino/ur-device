@@ -1,0 +1,101 @@
+/*
+ * Tencent is pleased to support the open source community by making IoT Hub
+ available.
+ * Copyright (C) 2018-2020 Tencent. All rights
+ reserved.
+
+ * Licensed under the MIT License (the "License"); you may not use this file
+ except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://opensource.org/licenses/MIT
+
+ * Unless required by applicable law or agreed to in writing, software
+ distributed under the License is
+ * distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND,
+ * either express or implied. See the License for the specific language
+ governing permissions and
+ * limitations under the License.
+ *
+ */
+
+/*
+ * UnitedRhino is pleased to support the open source community by making IoT Hub
+ available.
+ * Copyright (C) 2018-2020 UnitedRhino. All rights
+ reserved.
+
+ * Licensed under the MIT License (the "License"); you may not use this file
+ except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://opensource.org/licenses/MIT
+
+ * Unless required by applicable law or agreed to in writing, software
+ distributed under the License is
+ * distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND,
+ * either express or implied. See the License for the specific language
+ governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "unitedrhino_iot_export.h"
+#include "unitedrhino_iot_import.h"
+
+#include "unitedrhino_wifi_config.h"
+#include "unitedrhino_wifi_config_internal.h"
+#include "ble_qiot_export.h"
+#include "ble_qiot_import.h"
+
+extern bool sg_gotip_flag;
+bool HAL_Wifi_IsConnected(void)
+{
+    // TODO, retrun true when you got ip
+    return sg_gotip_flag;
+}
+
+int HAL_Wifi_read_err_log(uint32_t offset, void *log, size_t log_size)
+{
+    Log_i("HAL_Wifi_read_err_log");
+
+    return UNITEDRHINO_RET_SUCCESS;
+}
+
+int HAL_Wifi_write_err_log(uint32_t offset, void *log, size_t log_size)
+{
+    Log_i("HAL_Wifi_write_err_log");
+
+    return UNITEDRHINO_RET_SUCCESS;
+}
+
+int HAL_Wifi_clear_err_log(void)
+{
+    Log_i("HAL_Wifi_clear_err_log");
+
+    return UNITEDRHINO_RET_SUCCESS;
+}
+
+ble_qiot_ret_status_t ble_combo_wifi_token_set(const char *token, uint16_t len)
+{
+    char terminated_token[MAX_TOKEN_LENGTH + 1] = {0};
+    if (token == NULL || len == 0 || len > MAX_TOKEN_LENGTH) {
+        return BLE_QIOT_RS_ERR_PARA;
+    }
+    memcpy(terminated_token, token, len);
+    qiot_device_bind_set_token(terminated_token);
+    /* Watcher 上持续 GATT 连接会挤占 DHCP/SNTP 的射频时隙；Token 已进入内存后安全释放 BLE。 */
+    ble_combo_release_radio_after_token();
+    return BLE_QIOT_RS_OK;
+}
+
+ble_qiot_ret_status_t ble_combo_wifi_log_get(void)
+{
+    app_send_ble_dev_log();
+    app_send_ble_error_log();
+    return 0;
+}

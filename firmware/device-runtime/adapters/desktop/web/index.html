@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- 本地设备界面：浏览器仅提供媒体驱动，C++持有设备身份及平台会话。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>可移植设备语音测试</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/client-theme.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>设备语音测试</h1>
+    <p>浏览器采集与播放，C++ 设备核心负责连接。此界面不验证硬件 AEC。</p>
+    <p id="status" role="status">尚未连接本机设备进程</p>
+    <section aria-label="设备控制">
+      <button id="activate">启用麦克风并连接</button>
+      <button id="start" disabled>开始 / 恢复输入</button>
+      <button id="stop" disabled>暂停输入</button>
+      <button id="cancel" disabled>打断当前回复</button>
+      <button id="end" disabled>结束会话</button>
+    </section>
+    <section id="endpointControls" aria-label="接续AI会话" hidden>
+      <p id="endpointStatus" role="status">等待本人接听邀请</p>
+      <button id="endpointAccept" disabled>接听AI接续</button>
+      <button id="endpointReject" disabled>拒绝AI接续</button>
+    </section>
+    <section id="endpointSourceControls" aria-label="将AI接续到其他设备" hidden>
+      <p id="endpointSourceStatus" role="status">等待原AI会话建立</p>
+      <label for="endpointSourceTarget">已授权目标端标识</label>
+      <input id="endpointSourceTarget" maxlength="128" autocomplete="off" placeholder="device:产品ID:设备名">
+      <button id="endpointSourcePrepare" disabled>准备接续</button>
+      <button id="endpointSourceCommit" disabled>确认移交</button>
+      <button id="endpointSourceAbort" disabled>撤销本次接续</button>
+      <button id="humanInputStop" disabled hidden>停止本人麦克风</button>
+    </section>
+    <section id="handoffControls" aria-label="AI转人工" hidden>
+      <p id="handoffStatus" role="status">等待设备确认可用操作</p>
+      <div id="handoffOutbound">
+      <label for="handoffTargetKind">目标类型</label>
+      <select id="handoffTargetKind"><option value="device">设备</option><option value="service">服务</option></select>
+      <label for="handoffTarget">明确目标标识</label>
+      <input id="handoffTarget" maxlength="128" autocomplete="off">
+      <label><input id="handoffShareContext" type="checkbox">显式分享本人已授权的完成文本（仅服务目标）</label>
+      <label for="handoffConsentId">本人授权引用</label>
+      <input id="handoffConsentId" maxlength="128" autocomplete="off">
+      <p>须先由本人账号创建授权，再填入原引用；本界面不创建或自动选择授权。</p>
+      <button id="handoffEscalate" disabled>转人工</button>
+      </div>
+      <button id="handoffAccept" disabled>接听</button>
+      <button id="handoffReject" disabled>拒接</button>
+      <button id="handoffCancel" disabled>取消候选</button>
+      <button id="handoffHangup" disabled>挂断人工通话</button>
+      <button id="handoffHold" disabled>保持人工通话</button>
+      <button id="handoffResume" disabled>恢复人工通话</button>
+      <button id="temporaryResumeAI" disabled hidden>手动恢复AI语音</button>
+      <p id="temporaryStatus" role="status"></p>
+      <p id="humanControlStatus" role="status">等待原控制状态</p>
+    </section>
+    <section aria-label="文字对话">
+      <label for="textInput">发送文字</label>
+      <textarea id="textInput" rows="3" maxlength="16384" disabled></textarea>
+      <label><input id="textAudio" type="checkbox" checked disabled>同时请求语音回复</label>
+      <button id="sendText" disabled>发送</button>
+    </section>
+    <p id="media">音频未初始化</p>
+    <p id="metrics">采集 0 帧，解码非静音 0 帧，音频线程消费 0 帧</p>
+    <pre id="transcript" aria-label="对话文本" aria-live="polite"></pre>
+  </main>
+</body>
+</html>

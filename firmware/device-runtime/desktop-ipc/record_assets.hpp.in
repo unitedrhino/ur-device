@@ -1,0 +1,13 @@
+// 文件说明：构建时内嵌历史专用固定页面，运行时只增加已配置档案字节，不按HTTP路径读磁盘。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// record_assets只返回固定本地资产，不含设备凭据／平台地址或任意文件路径。
+inline std::map<std::string, std::string> record_assets() {
+    return {{"/index.html", R"RECORD_HTML(@UR_RECORD_HTML@)RECORD_HTML"},
+            {"/app.js", R"RECORD_HOST(@UR_RECORD_HOST_JS@)RECORD_HOST"},
+            {"/record-source.js", R"RECORD_SOURCE(@UR_RECORD_SOURCE_JS@)RECORD_SOURCE"},
+            {"/app.css", "body{font-family:sans-serif;max-width:860px;margin:2em auto;padding:1em}video{max-width:100%}button{padding:.7em}"}};
+}
+} // namespace ur::device

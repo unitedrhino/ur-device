@@ -1,0 +1,117 @@
+/*
+ * Tencent is pleased to support the open source community by making IoT Hub
+ available.
+ * Copyright (C) 2016 Tencent. All rights reserved.
+
+ * Licensed under the MIT License (the "License"); you may not use this file
+ except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://opensource.org/licenses/MIT
+
+ * Unless required by applicable law or agreed to in writing, software
+ distributed under the License is
+ * distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND,
+ * either express or implied. See the License for the specific language
+ governing permissions and
+ * limitations under the License.
+ *
+ */
+
+/*
+ * UnitedRhino is pleased to support the open source community by making IoT Hub
+ available.
+ * Copyright (C) 2016 UnitedRhino. All rights reserved.
+
+ * Licensed under the MIT License (the "License"); you may not use this file
+ except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://opensource.org/licenses/MIT
+
+ * Unless required by applicable law or agreed to in writing, software
+ distributed under the License is
+ * distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND,
+ * either express or implied. See the License for the specific language
+ governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#ifndef UNITEDRHINO_IOT_UTILS_LIST_H_
+#define UNITEDRHINO_IOT_UTILS_LIST_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdlib.h>
+
+/*
+ * ListNode iterator direction
+ */
+typedef enum { LIST_HEAD, LIST_TAIL } ListDirection;
+
+/*
+ * define list node
+ */
+typedef struct ListNode {
+    struct ListNode *prev;
+    struct ListNode *next;
+    void *           val;
+} ListNode;
+
+/*
+ * Double Linked List
+ */
+typedef struct {
+    ListNode *   head;
+    ListNode *   tail;
+    unsigned int len;
+    void (*free)(void *val);
+    int (*match)(void *a, void *b);
+} List;
+
+/*
+ * list iterator
+ */
+typedef struct {
+    ListNode *    next;
+    ListDirection direction;
+} ListIterator;
+
+/* create node */
+ListNode *list_node_new(void *val);
+
+/* create list */
+List *unitedrhino_list_new(void);
+
+ListNode *unitedrhino_list_rpush(List *self, ListNode *node);
+
+ListNode *unitedrhino_list_lpush(List *self, ListNode *node);
+
+ListNode *unitedrhino_list_find(List *self, void *val);
+
+ListNode *unitedrhino_list_at(List *self, int index);
+
+ListNode *unitedrhino_list_rpop(List *self);
+
+ListNode *unitedrhino_list_lpop(List *self);
+
+void unitedrhino_list_remove(List *self, ListNode *node);
+
+void unitedrhino_list_destroy(List *self);
+
+/* create iterator */
+ListIterator *unitedrhino_list_iterator_new(List *list, ListDirection direction);
+
+ListIterator *unitedrhino_list_iterator_new_from_node(ListNode *node, ListDirection direction);
+
+ListNode *unitedrhino_list_iterator_next(ListIterator *self);
+
+void unitedrhino_list_iterator_destroy(ListIterator *self);
+
+#ifdef __cplusplus
+}
+#endif
+#endif  // UNITEDRHINO_IOT_UTILS_LIST_H_

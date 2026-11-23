@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- 文件说明：历史档案源的回环验证页面；没有实时采集、物理输出或自由平台命令。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>历史录像源验证</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/record-source.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>历史录像源验证</h1>
+    <p>只读取已配置档案，不启用摄像头、麦克风或扬声器。</p>
+    <p id="record-status" role="status">正在连接本地设备宿主</p>
+    <p id="record-session">尚无档案会话</p>
+    <div id="record-media"></div>
+    <button id="record-close" type="button">关闭验证宿主</button>
+  </main>
+</body>
+</html>

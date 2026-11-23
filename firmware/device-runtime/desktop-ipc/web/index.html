@@ -1,0 +1,13 @@
+<!-- IPC软件设备只展示授权观看者的本地采集；不直接连接云端信令。 -->
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>IPC 软件设备</title></head>
+<body><h1>IPC 软件设备</h1><p id="status">尚未连接平台</p>
+<button id="activate">连接平台</button><button id="shutdown">停止设备</button>
+<button id="doorbell" disabled>按下门铃</button><p id="doorbell-status">门铃事件出口未启用或未就绪。</p>
+<button id="privacy-enable" disabled>上报隐私开启</button><button id="privacy-disable" disabled>上报隐私关闭</button>
+<p id="privacy-status">隐私属性出口默认关闭；上报确认不代表采集已经停止，关闭隐私也不会自动恢复旧媒体。</p>
+<p id="human-status">人际通话入口默认关闭；按下门铃不等于接听或授权音视频。</p>
+<label>呼叫设备（产品:设备）<input id="call-target" maxlength="128"></label><button id="call-dial">呼叫设备</button>
+<label>接续设备（产品:设备）<input id="endpoint-target" maxlength="121"></label>
+<button id="endpoint-prepare">准备接续</button><button id="endpoint-commit">提交接续</button><button id="endpoint-abort">取消接续</button>
+<p id="endpoint-status">接续尚未发起；准备不会停止原端，提交成功与实际停止分别确认。</p>
+<div id="views"></div><script src="/app.js"></script></body></html>

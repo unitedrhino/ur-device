@@ -1,0 +1,1 @@
+{"msgToken":"create","method":"sessionCreated","sessionId":"fuzz-ai","code":200,"data":{"state":"negotiating","endpointEpoch":1e0,"capabilityRevision":1,"selected":{"transport":"none","inputModalities":["text"],"outputModalities":["text"]},"tracks":[]}}

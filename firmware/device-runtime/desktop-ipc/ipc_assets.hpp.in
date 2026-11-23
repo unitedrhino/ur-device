@@ -1,0 +1,11 @@
+// 文件说明：构建时内嵌固定IPC页面，运行时不按HTTP请求路径读取宿主文件。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// ipc_assets 返回回环桥白名单资产，不包含设备凭据或环境地址。
+inline std::map<std::string, std::string> ipc_assets() {
+    return {{"/index.html", R"IPC_HTML(@UR_IPC_HTML@)IPC_HTML"},
+            {"/app.js", R"IPC_JS(@UR_IPC_JS@)IPC_JS"}};
+}
+} // namespace ur::device

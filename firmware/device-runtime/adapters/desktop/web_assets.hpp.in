@@ -1,0 +1,20 @@
+// 构建时嵌入固定界面资产，不按HTTP请求读取本地文件系统。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// browser_assets返回固定HTTP路径与原始UTF-8内容，不读取用户指定文件。
+inline std::map<std::string, std::string> browser_assets() {
+    // 生成器按原占位符完整字节替换；此处不是C++表达式，格式化不能在@边界插空格。
+    // clang-format off
+    return {{"/index.html", @UR_WEB_HTML@},
+            {"/app.css", @UR_WEB_CSS@},
+            {"/app.js", @UR_WEB_JS@},
+            {"/client-theme.js", @UR_CLIENT_THEME@},
+            {"/input-ownership.js", @UR_INPUT_OWNERSHIP@},
+            {"/human-voice-media.js", @UR_HUMAN_VOICE_MEDIA@},
+            {"/audio-worklet.js", @UR_WEB_WORKLET@},
+            {"/call-worklet.js", @UR_CALL_WORKLET@}};
+    // clang-format on
+}
+}  // namespace ur::device

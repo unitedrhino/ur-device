@@ -1,0 +1,1 @@
+{"msgToken":"fuzz-speaker","method":"trackControl","sessionId":"fuzz-ipc","eventSeq":3,"params":{"trackId":"speaker-1","operation":"pause","mediaRevision":1}}

@@ -1,0 +1,11 @@
+// 固定文件媒体组件资产；显式使用才启用媒体桥，原AI页面不隐含开启节目能力。
+#pragma once
+#include <map>
+#include <string>
+namespace ur::device {
+// file_assets 返回原始UTF-8组件源码，不读取运行时自由路径。
+inline std::map<std::string, std::string> file_assets() {
+    return {{"/file-player.js", @UR_FILE_PLAYER@}, {"/file-worklet.js", @UR_FILE_WORKLET@},
+            {"/file-lane.js", @UR_FILE_LANE@}, {"/file-host.js", @UR_FILE_HOST@}};
+}
+} // namespace ur::device

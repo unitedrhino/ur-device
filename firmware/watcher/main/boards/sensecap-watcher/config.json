@@ -1,0 +1,31 @@
+{
+    "type": "sensecap-watcher",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "sensecap-watcher",
+            "sdkconfig_append": [
+                "CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/32m-video.csv\"",
+                "CONFIG_BOOTLOADER_CACHE_32BIT_ADDR_QUAD_FLASH=y",
+                "CONFIG_ESPTOOLPY_FLASH_MODE_AUTO_DETECT=n",
+                "CONFIG_IDF_EXPERIMENTAL_FEATURES=y",
+                "CONFIG_FREERTOS_HZ=1000",
+                "CONFIG_BT_ENABLED=y",
+                "CONFIG_BT_BLUEDROID_ENABLED=y",
+                "CONFIG_BT_BLE_ENABLED=y",
+                "CONFIG_BT_GATTS_ENABLE=y",
+                "CONFIG_UR_BLE_PROVISION=y",
+                "CONFIG_UR_PLATFORM_OTA=y",
+                "CONFIG_UR_AI=y",
+                "CONFIG_USE_MULTILINE_CHAT_MESSAGE=y",
+                "CONFIG_USE_AFE_WAKE_WORD=y",
+                "CONFIG_UR_SOFTWARE_AEC=y",
+                "CONFIG_ESP32S3_DATA_CACHE_32KB=n",
+                "CONFIG_ESP32S3_DATA_CACHE_64KB=y",
+                "CONFIG_SEND_WAKE_WORD_DATA=n",
+                "CONFIG_LV_FONT_MONTSERRAT_48=y"
+            ]
+        }
+    ]
+}

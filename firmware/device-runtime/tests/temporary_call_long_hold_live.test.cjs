@@ -1,0 +1,28 @@
+// 文件说明：长保持验收的可控时钟离线回归；不启动真实Provider、浏览器、容器或35秒等待。
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const runner=require('./temporary_call_long_hold_live.cjs');
+// lifetime固定原五字段投影，私有关联仅测试内存；不声称模拟为真实供应商证据。
+function lifetime(stage='held'){const join='a'.repeat(64),generation='b'.repeat(32);return {join,records:['connected','held',...(stage==='resumed'?['resumed']:[])].map(stage=>({kind:'providerLifetime',provider:'doubao',stage,join,generation}))};}
+// context提供原页面快照形状及可控单调时钟，保证长保持用例不执行真实sleep。
+function context({deadline=180000,failAt=Infinity,mediaStopAt=Infinity}={}){let elapsed=0,reads=0,checks=0;const pair=()=>[0,1].map(index=>({captureClosed:true,activeReply:false,media:{session:'human-'+index,peerEpoch:'peer-'+index,peerFingerprint:'c'.repeat(64),frames:20+reads,nonSilentFrames:10+reads,inputAttached:elapsed<mediaStopAt,outputEnabled:true,held:false,connected:true}}));return {clock:{now:()=>elapsed,sleep:async ms=>{elapsed+=ms;}},value:{sourceSessionId:'original',deadline,guard(){assert.ok(elapsed<failAt,'device_ended_early');},async readPair(){reads++;return pair();},async verifyHuman(){checks++;}},checks:()=>checks};}
+test('显式开关/恢复variant/原供应商观察器缺失均在原资源启动前拒绝',async()=>{
+ const observer={readProviderLifetime(){}};const env={UR_TEMPORARY_NATIVE_LONG_HOLD_LIVE:'1',UR_TEMPORARY_CALL_VARIANT:'resume'};
+ assert.equal(runner.validateLongHold(env,observer),35000);for(const bad of [{},{...env,UR_TEMPORARY_NATIVE_LONG_HOLD_LIVE:'0'},{...env,UR_TEMPORARY_CALL_VARIANT:'stop'}])assert.throws(()=>runner.validateLongHold(bad,observer));assert.throws(()=>runner.validateLongHold(env,{}));await assert.rejects(runner.run({},{}));
+});
+test('唯一原nonce连接保持与恢复事实严格有序，不接受缺失unknown/新连接/替换供应商实例',()=>{
+ const held=lifetime();assert.equal(runner.verifyProvider(held,'held'),'b'.repeat(32));assert.equal(runner.verifyProvider(lifetime('resumed'),'resumed','b'.repeat(32)),'b'.repeat(32));
+ for(const rows of [[],[held.records[0]],[...held.records,held.records[0]],[...held.records,{...held.records[1],stage:'unknown'}],[held.records[0],{...held.records[1],generation:'d'.repeat(32)}],[{...held.records[0],stage:'held'},held.records[1]],[held.records[0],{...held.records[1],stage:'closed'}]])assert.throws(()=>runner.verifyProvider({...held,records:rows},'held'));
+ assert.throws(()=>runner.verifyProvider(lifetime('resumed'),'resumed','e'.repeat(32)));assert.throws(()=>runner.verifyProvider({...held,records:held.records.map(row=>({...row,join:'f'.repeat(64)}))},'held'));
+});
+test('provider访问器、私有额外字段和未知关联不可读取或当作成功',()=>{let read=false;const value=lifetime();Object.defineProperty(value,'join',{get(){read=true;throw Error('private');}});assert.throws(()=>runner.verifyProvider(value,'held'));assert.equal(read,false);assert.throws(()=>runner.verifyProvider({...lifetime(),secret:'hidden'},'held'));assert.throws(()=>runner.verifyProvider({...lifetime(),join:'unknown'},'held'));});
+test('35秒保持持续核双方实际媒体和暂停证明，在原180秒预算内完成，不裸sleep',async()=>{const ctx=context();const observed=await runner.holdVerified(ctx.value,async()=>lifetime(),ctx.clock);assert.equal(observed.elapsedMs,35000);assert.ok(ctx.checks()>=35);assert.equal(observed.generation,'b'.repeat(32));});
+test('原deadline不足/保持中到期、双端提前退出或采集停止立即失败',async()=>{
+ const short=context({deadline:35000});await assert.rejects(runner.holdVerified(short.value,async()=>lifetime(),short.clock),/long_hold_budget_insufficient/);
+ const deadline=context();deadline.clock.sleep=async()=>{deadline.value.deadline=1;deadline.clock.now=()=>2;};await assert.rejects(runner.holdVerified(deadline.value,async()=>lifetime(),deadline.clock),/long_hold_deadline/);
+ const ended=context({failAt:3000});await assert.rejects(runner.holdVerified(ended.value,async()=>lifetime(),ended.clock),/device_ended_early/);
+ const stopped=context({mediaStopAt:3000});await assert.rejects(runner.holdVerified(stopped.value,async()=>lifetime(),stopped.clock),/long_hold_human_media_closed/);
+});
+test('保持期间原模型终止、未知或替换nonce均失败，不能只在恢复后看一份摘要',async()=>{for(const stage of ['closed','unknown','replaced']){const ctx=context();let seen=0;await assert.rejects(runner.holdVerified(ctx.value,async()=>{const data=lifetime();if(++seen>3)data.records[1]={...data.records[1],...(stage==='replaced'?{generation:'e'.repeat(32)}:{stage})};return data;},ctx.clock));}});
+test('保持期间重建人际Peer、倒退计数或用户stop不得被末尾有声总计数覆盖',async()=>{for(const failure of ['peer','counter','stop']){const ctx=context(),original=ctx.value.readPair;let reads=0;ctx.value.readPair=async()=>{const pair=await original();pair[0].voice={userStops:0};if(++reads>3){if(failure==='peer')pair[0].media.peerEpoch='replaced';if(failure==='counter')pair[0].media.frames=0;if(failure==='stop')pair[0].voice.userStops=1;}return pair;};await assert.rejects(runner.holdVerified(ctx.value,async()=>lifetime(),ctx.clock));}});
+test('长保持hook失败仍委托原驱动finally及报告，不以新wrapper掩盖原失败',async()=>{const native=require('./temporary_call_voice_live.cjs'),original=native.run;let closed=false,reported=false;const failure=Error('original_provider_observer_failed');native.run=async(_env,_observer,options)=>{try{await options.holdOriginal({sourceSessionId:'original',deadline:performance.now()+180000,guard(){},readPair:async()=>[],verifyHuman:async()=>{}});}finally{closed=true;options.report({passed:false,cleanup:{devicesClosed:true,browsersClosed:true}});}};try{await assert.rejects(runner.run({UR_TEMPORARY_NATIVE_LONG_HOLD_LIVE:'1',UR_TEMPORARY_CALL_VARIANT:'resume'},{readProviderLifetime:async()=>{throw failure;}},{report(value){reported=true;assert.equal(value.sameOriginalProviderVerified,false);assert.equal(value.longHoldMs,0);}}),error=>error===failure);assert.equal(closed,true);assert.equal(reported,true);}finally{native.run=original;}});

@@ -1,0 +1,13 @@
+# ESP-IDF Partition Table（Watcher 32MB Flash 扩展布局）
+# Name,   Type, SubType, Offset,  Size, Flags
+# 与 32m.csv 的差异：OTA 分区扩至 6M，assets 后移至 0xE00000。
+# 普通 OTA 不会更新分区表，旧 4M 布局设备必须先完成受控迁移，不可直接使用本布局镜像升级。
+# 兼容约束：ota_0 偏移保持 0x200000 与 32m.csv 一致，nvs/otadata/phy_init 相对布局不变，
+# 保证两套分区表在彼此之间全量烧录回退时用户数据区（nvsfactory/nvs/otadata/phy_init）不挪位。
+nvsfactory, data,   nvs,        ,     200K,
+nvs,        data,   nvs,        ,     840K,
+otadata,    data,   ota,        ,     0x2000,
+phy_init,   data,   phy,        ,     0x1000,
+ota_0,      app,    ota_0,      0x200000,     6M,
+ota_1,      app,    ota_1,      0x800000,     6M,
+assets,     data,   spiffs,     0xE00000,     16M

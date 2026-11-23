@@ -1,0 +1,43 @@
+<!doctype html>
+<!-- 文件说明：人际视频模拟设备本地界面；MQTT身份与协议状态仍在C++进程。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设备视频通话测试</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>设备视频通话</h1>
+    <p>本机浏览器提供摄像头、麦克风和扬声器；设备身份、信令和会话由 C++ 持有。</p>
+    <p id="status" role="status">尚未连接</p>
+    <section aria-label="通话控制">
+      <button id="activate">验证设备并连接</button>
+      <label for="target">目标设备</label>
+      <input id="target" type="text" maxlength="128" placeholder="productID:deviceName" autocomplete="off">
+      <button id="dial" disabled>呼叫设备</button>
+      <button id="accept" disabled>接听</button>
+      <button id="reject" disabled>拒接</button>
+      <button id="mute" disabled>静音</button>
+      <button id="camera" disabled>关摄像头</button>
+      <button id="hold" disabled>保持</button>
+      <button id="resume" disabled>恢复</button>
+      <button id="cancel" disabled>取消呼叫</button>
+      <label for="transferTarget">转接设备</label>
+      <input id="transferTarget" type="text" maxlength="128" placeholder="productID:deviceName" autocomplete="off" disabled>
+      <button id="transfer" disabled>转接</button>
+      <button id="cancelTransfer" disabled>撤销候选</button>
+      <button id="hangup" disabled>挂断</button>
+    </section>
+    <section aria-label="媒体轨">
+      <video id="local" autoplay muted playsinline width="320" height="240"></video>
+      <video id="remote" muted playsinline width="320" height="240"></video>
+      <audio id="remoteAudio" muted></audio>
+    </section>
+    <p id="media">摄像头和麦克风尚未验证</p>
+    <p id="metrics">音视频帧尚未开始</p>
+  </main>
+</body>
+</html>

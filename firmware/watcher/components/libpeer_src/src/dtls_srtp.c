@@ -1,0 +1,1001 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "address.h"
+#include "config.h"
+#include "dtls_srtp.h"
+
+#include <esp_random.h>
+#include <mbedtls/platform.h>
+#include <esp_heap_caps.h>
+
+#ifdef ESP_PLATFORM
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
+
+/* mbedTLS DTLS/SSL 上下文单块可达数十 KB，纯内部堆实测 -0x008d
+ * ALLOC_FAILED；经 mbedtls 平台分配器把大块定向 PSRAM（小请求保持
+ * 内部 RAM 以兼顾性能），不改变全局 malloc 行为（BT/WiFi 不受影响）。 */
+static void* dtls_calloc_psram(size_t n, size_t size) {
+  size_t bytes = n * size;
+  void* p = (bytes > 2048) ? heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                           : heap_caps_calloc(1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  return p;
+}
+
+static void dtls_free_psram(void* ptr) {
+  heap_caps_free(ptr);
+}
+
+/* mbedTLS4 移除 entropy 模块：按 esp_peer dtls_common.h 的做法以硬件
+ * 随机作为 ctr_drbg 种子源（PSA 时代标准替代）。 */
+static int dtls_srtp_entropy_source(void* ctx, unsigned char* buf, size_t len) {
+  (void)ctx;
+  esp_fill_random(buf, len);
+  return 0;
+}
+
+/* dtls_srtp_install_allocator 幂等安装平台分配器；须在首个 ssl 上下文
+ * 创建前调用一次。 */
+static void dtls_srtp_install_allocator(void) {
+  static bool installed = false;
+  if (!installed) {
+    installed = true;
+    mbedtls_platform_set_calloc_free(dtls_calloc_psram, dtls_free_psram);
+  }
+}
+#if CONFIG_MBEDTLS_DEBUG
+#include "mbedtls/debug.h"
+#endif
+#include "mbedtls/md.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/version.h"
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+#include "psa/crypto.h"
+#endif
+#include "ports.h"
+#include "socket.h"
+#include "utils.h"
+
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+/* DTLS 自签证书进程级缓存：设备只维护单个 DTLS peer，证书与私钥可在会话间
+ * 复用。s_shared_state 为状态机：0 未开始、1 生成中、2 就绪、3 失败。
+ * s_shared_key_id 与 s_shared_cert_pem 的写入先于 state=2 发布，读写两侧
+ * 用 __sync_synchronize() 配对，避免双核重排导致读到半成品。 */
+static mbedtls_svc_key_id_t s_shared_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+static char s_shared_cert_pem[2048];
+static volatile int s_shared_state = 0;
+#endif
+
+int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
+  DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+  UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
+
+  int ret = udp_socket_sendto(udp_socket, dtls_srtp->remote_addr, buf, len);
+
+  return ret;
+}
+
+int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
+  DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+  UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
+
+  int ret;
+
+  while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
+    ports_sleep_ms(1);
+  }
+
+  return ret;
+}
+
+static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
+  int i;
+  unsigned char digest[32];
+  const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (md_info == NULL || mbedtls_md(md_info, crt->raw.p, crt->raw.len, digest) != 0) {
+    memset(digest, 0, sizeof(digest));
+  }
+
+  for (i = 0; i < 32; i++) {
+    snprintf(buf, 4, "%.2X:", digest[i]);
+    buf += 3;
+  }
+
+  *(--buf) = '\0';
+}
+
+// Do not verify CA
+static int dtls_srtp_cert_verify(void* data, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
+  *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_BAD_KEY);
+  return 0;
+}
+
+static int dtls_srtp_generate_keypair(DtlsSrtp* dtls_srtp) {
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  int ret;
+  mbedtls_svc_key_id_t key_id = MBEDTLS_SVC_KEY_ID_INIT;
+  psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+
+  psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_VERIFY_HASH);
+#if CONFIG_DTLS_USE_ECDSA
+  psa_set_key_algorithm(&attr, MBEDTLS_PK_ALG_ECDSA(PSA_ALG_SHA_256));
+  psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+  psa_set_key_bits(&attr, 256);
+#else
+  psa_set_key_algorithm(&attr, PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256));
+  psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_KEY_PAIR);
+  psa_set_key_bits(&attr, RSA_KEY_LENGTH);
+#endif
+  if (psa_generate_key(&attr, &key_id) != PSA_SUCCESS) {
+    psa_reset_key_attributes(&attr);
+    LOGE("psa_generate_key failed");
+    return -1;
+  }
+  psa_reset_key_attributes(&attr);
+
+  ret = mbedtls_pk_wrap_psa(&dtls_srtp->pkey, key_id);
+  if (ret != 0) {
+    psa_destroy_key(key_id);
+    LOGE("mbedtls_pk_wrap_psa failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  dtls_srtp->psa_key_id = key_id;
+#endif
+  return 0;
+#else
+#if CONFIG_DTLS_USE_ECDSA
+  int ret = mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+  if (ret != 0) {
+    return ret;
+  }
+  return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,
+                             mbedtls_pk_ec(dtls_srtp->pkey),
+                             mbedtls_ctr_drbg_random,
+                             &dtls_srtp->ctr_drbg);
+#else
+  int ret = mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+  if (ret != 0) {
+    return ret;
+  }
+  return mbedtls_rsa_gen_key(mbedtls_pk_rsa(dtls_srtp->pkey),
+                             mbedtls_ctr_drbg_random,
+                             &dtls_srtp->ctr_drbg,
+                             RSA_KEY_LENGTH,
+                             65537);
+#endif
+#endif
+}
+
+/* dtls_srtp_cache_cert_pem：把自签证书 PEM 复制进全局缓存；仅在缓存为空时
+ * 写入，避免覆盖其它会话正在引用的材料。 */
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+static void dtls_srtp_cache_cert_pem(const unsigned char* pem) {
+  size_t len;
+
+  if (pem == NULL || s_shared_cert_pem[0] != '\0') {
+    return;
+  }
+  len = strlen((const char*)pem);
+  if (len + 1 > sizeof(s_shared_cert_pem)) {
+    LOGE("cert pem too large: %u", (unsigned int)len);
+    return;
+  }
+  memcpy(s_shared_cert_pem, pem, len + 1);
+  __sync_synchronize();
+}
+#endif
+
+static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
+  int ret;
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  mbedtls_x509write_cert crt;
+  unsigned char* cert_buf = NULL;
+  unsigned char serial_raw[16];
+
+  cert_buf = (unsigned char*)malloc(RSA_KEY_LENGTH * 2);
+  if (cert_buf == NULL) {
+    LOGE("malloc failed");
+    return -1;
+  }
+
+  ret = dtls_srtp_generate_keypair(dtls_srtp);
+  if (ret != 0) {
+    free(cert_buf);
+    return ret;
+  }
+
+  mbedtls_x509write_crt_init(&crt);
+  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
+  mbedtls_x509write_crt_set_issuer_key(&crt, &dtls_srtp->pkey);
+  mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
+  mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+  ret = mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_subject_name failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+  ret = mbedtls_x509write_crt_set_issuer_name(&crt, "CN=dtls_srtp");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_issuer_name failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  if (psa_generate_random(serial_raw, sizeof(serial_raw)) != PSA_SUCCESS) {
+    memset(serial_raw, 0xA5, sizeof(serial_raw));
+  }
+  ret = mbedtls_x509write_crt_set_serial_raw(&crt, serial_raw, sizeof(serial_raw));
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_serial_raw failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509write_crt_set_validity(&crt, "20260101000000", "20360101000000");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_validity failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH);
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_pem failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, strlen((char*)cert_buf) + 1);
+  if (ret == 0) {
+    dtls_srtp_cache_cert_pem(cert_buf);
+  }
+  mbedtls_x509write_crt_free(&crt);
+  free(cert_buf);
+  if (ret != 0) {
+    LOGE("mbedtls_x509_crt_parse failed -0x%.4x", (unsigned int)-ret);
+  }
+  return ret;
+#else
+
+  mbedtls_x509write_cert crt;
+
+  unsigned char* cert_buf = NULL;
+#if CONFIG_MBEDTLS_2_X
+  mbedtls_mpi serial;
+#else
+  const char* serial = "peer";
+#endif
+  const char* pers = "dtls_srtp";
+
+  cert_buf = (unsigned char*)malloc(RSA_KEY_LENGTH * 2);
+  if (cert_buf == NULL) {
+    LOGE("malloc failed");
+    return -1;
+  }
+
+  ret = mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg,
+                              dtls_srtp_entropy_source,
+                              NULL,
+                              (const unsigned char*)pers,
+                              strlen(pers));
+  if (ret != 0) {
+    free(cert_buf);
+    LOGE("mbedtls_ctr_drbg_seed failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = dtls_srtp_generate_keypair(dtls_srtp);
+  if (ret != 0) {
+    free(cert_buf);
+    return ret;
+  }
+
+  mbedtls_x509write_crt_init(&crt);
+
+  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
+
+  mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
+
+  mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+
+  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
+
+  mbedtls_x509write_crt_set_issuer_key(&crt, &dtls_srtp->pkey);
+
+  ret = mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_subject_name failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509write_crt_set_issuer_name(&crt, "CN=dtls_srtp");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_issuer_name failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+#if CONFIG_MBEDTLS_2_X
+  mbedtls_mpi_init(&serial);
+  mbedtls_mpi_fill_random(&serial, 16, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+  ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
+  if (ret < 0) {
+    LOGE("mbedtls_x509write_crt_set_serial failed -0x%.4x", (unsigned int)-ret);
+  }
+#else
+  ret = mbedtls_x509write_crt_set_serial_raw(&crt, (unsigned char*)serial, strlen(serial));
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_serial_raw failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+#endif
+
+  ret = mbedtls_x509write_crt_set_validity(&crt, "20260101000000", "20360101000000");
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_set_validity failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+
+  if (ret < 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509write_crt_pem failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  ret = mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, strlen((char*)cert_buf) + 1);
+  if (ret != 0) {
+    mbedtls_x509write_crt_free(&crt);
+    free(cert_buf);
+    LOGE("mbedtls_x509_crt_parse failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
+
+  mbedtls_x509write_crt_free(&crt);
+
+  free(cert_buf);
+
+  return ret;
+#endif
+}
+
+#if CONFIG_MBEDTLS_DEBUG
+static void dtls_srtp_debug(void* ctx, int level, const char* file, int line, const char* str) {
+  LOGD("%s:%04d: %s", file, line, str);
+}
+#endif
+
+/* dtls_srtp_use_shared_cert：把预热好的私钥与证书挂到当前会话。
+ * 返回 0 表示命中缓存；-1 表示不可用，调用方回退到现场生成。
+ * 预热进行中最多等待 2000ms（10ms 步进），避免用户开机后立刻发起连接时
+ * 与 RSA 生成竞争；超时后现场生成，功能不受影响。 */
+static int dtls_srtp_use_shared_cert(DtlsSrtp* dtls_srtp) {
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  int ret;
+  int waited_ms = 0;
+
+  while (s_shared_state == 1 && waited_ms < 2000) {
+    ports_sleep_ms(10);
+    waited_ms += 10;
+  }
+  if (s_shared_state != 2) {
+    if (waited_ms > 0) {
+      ESP_LOGW("dtls_srtp", "[connect-ms] stage=cert_cache_wait_timeout waited=%d state=%d t=%lld",
+               waited_ms, s_shared_state,
+               (long long)(esp_timer_get_time() / 1000));
+    }
+    return -1;
+  }
+  __sync_synchronize();
+
+  ret = mbedtls_pk_wrap_psa(&dtls_srtp->pkey, s_shared_key_id);
+  if (ret != 0) {
+    LOGE("shared mbedtls_pk_wrap_psa failed -0x%.4x", (unsigned int)-ret);
+    return -1;
+  }
+  ret = mbedtls_x509_crt_parse(&dtls_srtp->cert,
+                               (const unsigned char*)s_shared_cert_pem,
+                               strlen(s_shared_cert_pem) + 1);
+  if (ret != 0) {
+    LOGE("shared mbedtls_x509_crt_parse failed -0x%.4x", (unsigned int)-ret);
+    /* 回退现场生成前必须清掉半初始化的 pk/x509 上下文。 */
+    mbedtls_pk_free(&dtls_srtp->pkey);
+    mbedtls_pk_init(&dtls_srtp->pkey);
+    mbedtls_x509_crt_free(&dtls_srtp->cert);
+    mbedtls_x509_crt_init(&dtls_srtp->cert);
+    return -1;
+  }
+
+  dtls_srtp->psa_key_id = s_shared_key_id;
+  dtls_srtp->shared_key = 1;
+  ESP_LOGI("dtls_srtp", "[connect-ms] stage=cert_cache_hit waited=%d t=%lld",
+           waited_ms, (long long)(esp_timer_get_time() / 1000));
+  return 0;
+#else
+  (void)dtls_srtp;
+  return -1;
+#endif
+}
+
+#if defined(ESP_PLATFORM) && MBEDTLS_VERSION_NUMBER >= 0x04000000
+/* dtls_srtp_prewarm_task：开机低优先级任务，生成一次自签证书并发布到共享
+ * 缓存。ECDSA P-256 生成远快于 RSA，放在低优先级任务里不阻塞启动。
+ * 栈 12288B：PSA 密钥生成 + X.509 写入实测超过 6144B（真机栈溢出重启），
+ * 留足余量。 */
+static void dtls_srtp_prewarm_task(void* arg) {
+  DtlsSrtp tmp;
+  int ret;
+  int64_t started_at = esp_timer_get_time();
+
+  (void)arg;
+  memset(&tmp, 0, sizeof(tmp));
+  mbedtls_pk_init(&tmp.pkey);
+  mbedtls_x509_crt_init(&tmp.cert);
+  tmp.psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+
+  if (psa_crypto_init() != PSA_SUCCESS) {
+    LOGE("prewarm psa_crypto_init failed");
+    s_shared_state = 3;
+    goto cleanup;
+  }
+
+  ret = dtls_srtp_selfsign_cert(&tmp);
+  if (ret == 0 && tmp.psa_key_id != MBEDTLS_SVC_KEY_ID_INIT) {
+    /* 先写 key id，再以 state=2 发布；读取侧用 __sync_synchronize() 配对。 */
+    s_shared_key_id = tmp.psa_key_id;
+    tmp.psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+    __sync_synchronize();
+    s_shared_state = 2;
+    ESP_LOGI("dtls_srtp", "[connect-ms] stage=prewarm_ready cost=%lld t=%lld",
+             (long long)((esp_timer_get_time() - started_at) / 1000),
+             (long long)(esp_timer_get_time() / 1000));
+  } else {
+    LOGE("prewarm selfsign failed -0x%.4x", (unsigned int)-ret);
+    if (tmp.psa_key_id != MBEDTLS_SVC_KEY_ID_INIT) {
+      psa_destroy_key(tmp.psa_key_id);
+      tmp.psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+    }
+    s_shared_state = 3;
+  }
+
+cleanup:
+  /* mbedtls_pk_free 只释放 pk 包装，不销毁 PSA key（IDF pk.h:190-194）；
+   * key 所有权已转交 s_shared_key_id，或失败路径已显式销毁。 */
+  mbedtls_pk_free(&tmp.pkey);
+  mbedtls_x509_crt_free(&tmp.cert);
+  vTaskDelete(NULL);
+}
+#endif
+
+void dtls_srtp_prewarm_async(void) {
+#if defined(ESP_PLATFORM) && MBEDTLS_VERSION_NUMBER >= 0x04000000
+  /* 幂等：预热已开始（生成中/就绪/失败）时不再重复生成。 */
+  if (s_shared_state != 0) {
+    return;
+  }
+  s_shared_state = 1;
+  if (xTaskCreate(dtls_srtp_prewarm_task, "dtls_prewarm", 12288, NULL, 1, NULL) != pdPASS) {
+    LOGE("prewarm task create failed");
+    s_shared_state = 3;
+  }
+#endif
+}
+
+int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
+  dtls_srtp_install_allocator();
+  int ret;
+  static const mbedtls_ssl_srtp_profile default_profiles[] = {
+      MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80,
+      MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_32,
+      MBEDTLS_TLS_SRTP_NULL_HMAC_SHA1_80,
+      MBEDTLS_TLS_SRTP_NULL_HMAC_SHA1_32,
+      MBEDTLS_TLS_SRTP_UNSET};
+
+  dtls_srtp->role = role;
+  dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+  dtls_srtp->user_data = user_data;
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  dtls_srtp->psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+  dtls_srtp->shared_key = 0;
+#endif
+  dtls_srtp->udp_send = dtls_srtp_udp_send;
+  dtls_srtp->udp_recv = dtls_srtp_udp_recv;
+
+  mbedtls_ssl_config_init(&dtls_srtp->conf);
+  mbedtls_ssl_init(&dtls_srtp->ssl);
+
+  mbedtls_x509_crt_init(&dtls_srtp->cert);
+  mbedtls_pk_init(&dtls_srtp->pkey);
+
+  mbedtls_ctr_drbg_init(&dtls_srtp->ctr_drbg);
+  dtls_srtp->initialized = 1;
+
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  if (psa_crypto_init() != PSA_SUCCESS) {
+    LOGE("psa_crypto_init failed");
+    return -1;
+  }
+#endif
+
+  if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    ret = mbedtls_ssl_config_defaults(&dtls_srtp->conf,
+                                      MBEDTLS_SSL_IS_SERVER,
+                                      MBEDTLS_SSL_TRANSPORT_DATAGRAM,
+                                      MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+      LOGE("mbedtls_ssl_config_defaults(server) failed -0x%.4x", (unsigned int)-ret);
+      return -1;
+    }
+
+    mbedtls_ssl_cookie_init(&dtls_srtp->cookie_ctx);
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    ret = mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx);
+#else
+    ret = mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+#endif
+    if (ret != 0) {
+      LOGE("mbedtls_ssl_cookie_setup failed -0x%.4x", (unsigned int)-ret);
+      return -1;
+    }
+
+    mbedtls_ssl_conf_dtls_cookies(&dtls_srtp->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check, &dtls_srtp->cookie_ctx);
+
+  } else {
+    ret = mbedtls_ssl_config_defaults(&dtls_srtp->conf,
+                                      MBEDTLS_SSL_IS_CLIENT,
+                                      MBEDTLS_SSL_TRANSPORT_DATAGRAM,
+                                      MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+      LOGE("mbedtls_ssl_config_defaults(client) failed -0x%.4x", (unsigned int)-ret);
+      return -1;
+    }
+  }
+
+#if CONFIG_MBEDTLS_DEBUG
+  mbedtls_debug_set_threshold(3);
+  mbedtls_ssl_conf_dbg(&dtls_srtp->conf, dtls_srtp_debug, NULL);
+#endif
+
+  /* ECDHE 曲线顺序：ESP32-S3 上 P-256 为纯软件实现（未开 ECP 定点优化），
+   * 单次 ECDHE/ECDSA 约 300-500ms；Curve25519 已启用，而平台 Pion 默认
+   * 首选 X25519，因此优先协商 X25519，P-256 仅作兼容回退。 */
+  static const uint16_t kDtlsGroups[] = {MBEDTLS_SSL_IANA_TLS_GROUP_X25519,
+                                         MBEDTLS_SSL_IANA_TLS_GROUP_SECP256R1, 0};
+  mbedtls_ssl_conf_groups(&dtls_srtp->conf, kDtlsGroups);
+
+  /* 证书优先复用开机预热结果；未就绪（预热中/失败/主机编译）时现场生成。 */
+  if (dtls_srtp_use_shared_cert(dtls_srtp) != 0) {
+    ret = dtls_srtp_selfsign_cert(dtls_srtp);
+    if (ret != 0) {
+      LOGE("dtls_srtp_selfsign_cert failed -0x%.4x", (unsigned int)-ret);
+      return -1;
+    }
+  }
+
+  mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
+  /*
+   * WebRTC peers use self-signed certificates and authenticate them with the
+   * fingerprint carried in SDP.  VERIFY_REQUIRED makes Mbed TLS 4.x require a
+   * TLS hostname as well, which does not exist for DTLS-SRTP peers.  Request
+   * and retain the peer certificate here, then verify its SHA-256 fingerprint
+   * after the handshake below.
+   */
+  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
+
+  ret = mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
+  if (ret != 0) {
+    LOGE("mbedtls_ssl_conf_own_cert failed -0x%.4x", (unsigned int)-ret);
+    return -1;
+  }
+
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
+  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+#endif
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+
+  dtls_srtp_x509_digest(&dtls_srtp->cert, dtls_srtp->local_fingerprint);
+
+  LOGD("local fingerprint: %s", dtls_srtp->local_fingerprint);
+
+  ret = mbedtls_ssl_conf_dtls_srtp_protection_profiles(&dtls_srtp->conf, default_profiles);
+  if (ret != 0) {
+    LOGE("mbedtls_ssl_conf_dtls_srtp_protection_profiles failed -0x%.4x", (unsigned int)-ret);
+    return -1;
+  }
+
+  mbedtls_ssl_conf_srtp_mki_value_supported(&dtls_srtp->conf, MBEDTLS_SSL_DTLS_SRTP_MKI_UNSUPPORTED);
+
+  mbedtls_ssl_conf_cert_req_ca_list(&dtls_srtp->conf, MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
+
+  ret = mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
+  if (ret != 0) {
+    LOGE("mbedtls_ssl_setup failed -0x%.4x", (unsigned int)-ret);
+    return -1;
+  }
+
+  return 0;
+}
+
+void dtls_srtp_deinit(DtlsSrtp* dtls_srtp) {
+  if (!dtls_srtp->initialized) {
+    return;
+  }
+
+  mbedtls_ssl_free(&dtls_srtp->ssl);
+  mbedtls_ssl_config_free(&dtls_srtp->conf);
+
+  mbedtls_x509_crt_free(&dtls_srtp->cert);
+  mbedtls_pk_free(&dtls_srtp->pkey);
+
+  mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
+
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+  if (dtls_srtp->psa_key_id != MBEDTLS_SVC_KEY_ID_INIT) {
+    /* 缓存 key 归全局所有，会话结束只断开引用；现场生成的 key 仍按原逻辑销毁。 */
+    if (!dtls_srtp->shared_key) {
+      psa_destroy_key(dtls_srtp->psa_key_id);
+    }
+    dtls_srtp->psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
+  }
+  dtls_srtp->shared_key = 0;
+#endif
+
+  if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    mbedtls_ssl_cookie_free(&dtls_srtp->cookie_ctx);
+  }
+
+  if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
+    srtp_dealloc(dtls_srtp->srtp_in);
+    srtp_dealloc(dtls_srtp->srtp_out);
+  }
+
+  dtls_srtp->initialized = 0;
+}
+
+static int dtls_srtp_key_derivation(DtlsSrtp* dtls_srtp, const unsigned char* master_secret, size_t secret_len, const unsigned char* randbytes, size_t randbytes_len, mbedtls_tls_prf_types tls_prf_type) {
+  int ret;
+  const char* dtls_srtp_label = "EXTRACTOR-dtls_srtp";
+  uint8_t key_material[DTLS_SRTP_KEY_MATERIAL_LENGTH];
+  // Export keying material
+  if ((ret = mbedtls_ssl_tls_prf(tls_prf_type, master_secret, secret_len, dtls_srtp_label,
+                                 randbytes, randbytes_len, key_material, sizeof(key_material))) != 0) {
+    LOGE("mbedtls_ssl_tls_prf failed(%d)", ret);
+    return ret;
+  }
+
+#if 0
+  int i, j;
+  printf("    DTLS-SRTP key material is:");
+  for (j = 0; j < sizeof(key_material); j++) {
+    if (j % 8 == 0) {
+      printf("\n    ");
+    }
+    printf("%02x ", key_material[j]);
+  }
+  printf("\n");
+
+  /* produce a less readable output used to perform automatic checks
+   * - compare client and server output
+   * - interop test with openssl which client produces this kind of output
+   */
+  printf("    Keying material: ");
+  for (j = 0; j < sizeof(key_material); j++) {
+    printf("%02X", key_material[j]);
+  }
+  printf("\n");
+#endif
+
+  const uint8_t* client_key = key_material;
+  const uint8_t* server_key = client_key + SRTP_MASTER_KEY_LENGTH;
+  const uint8_t* client_salt = server_key + SRTP_MASTER_KEY_LENGTH;
+  const uint8_t* server_salt = client_salt + SRTP_MASTER_SALT_LENGTH;
+  const uint8_t *local_key, *remote_key, *local_salt, *remote_salt;
+  if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    local_key = server_key;
+    local_salt = server_salt;
+    remote_key = client_key;
+    remote_salt = client_salt;
+  } else {
+    local_key = client_key;
+    local_salt = client_salt;
+    remote_key = server_key;
+    remote_salt = server_salt;
+  }
+  // derive inbounds keys
+
+  memset(&dtls_srtp->remote_policy, 0, sizeof(dtls_srtp->remote_policy));
+
+  srtp_crypto_policy_set_rtp_default(&dtls_srtp->remote_policy.rtp);
+  srtp_crypto_policy_set_rtcp_default(&dtls_srtp->remote_policy.rtcp);
+
+  memcpy(dtls_srtp->remote_policy_key, remote_key, SRTP_MASTER_KEY_LENGTH);
+  memcpy(dtls_srtp->remote_policy_key + SRTP_MASTER_KEY_LENGTH, remote_salt, SRTP_MASTER_SALT_LENGTH);
+
+  dtls_srtp->remote_policy.ssrc.type = ssrc_any_inbound;
+  dtls_srtp->remote_policy.key = dtls_srtp->remote_policy_key;
+  dtls_srtp->remote_policy.next = NULL;
+
+  if (srtp_create(&dtls_srtp->srtp_in, &dtls_srtp->remote_policy) != srtp_err_status_ok) {
+    LOGD("Error creating inbound SRTP session for component");
+    return -1;
+  }
+
+  LOGI("Created inbound SRTP session");
+
+  // derive outbounds keys
+  memset(&dtls_srtp->local_policy, 0, sizeof(dtls_srtp->local_policy));
+
+  srtp_crypto_policy_set_rtp_default(&dtls_srtp->local_policy.rtp);
+  srtp_crypto_policy_set_rtcp_default(&dtls_srtp->local_policy.rtcp);
+
+  memcpy(dtls_srtp->local_policy_key, local_key, SRTP_MASTER_KEY_LENGTH);
+  memcpy(dtls_srtp->local_policy_key + SRTP_MASTER_KEY_LENGTH, local_salt, SRTP_MASTER_SALT_LENGTH);
+
+  dtls_srtp->local_policy.ssrc.type = ssrc_any_outbound;
+  dtls_srtp->local_policy.key = dtls_srtp->local_policy_key;
+  dtls_srtp->local_policy.next = NULL;
+
+  if (srtp_create(&dtls_srtp->srtp_out, &dtls_srtp->local_policy) != srtp_err_status_ok) {
+    LOGE("Error creating outbound SRTP session");
+    return -1;
+  }
+
+  LOGI("Created outbound SRTP session");
+  return 0;
+}
+
+#if CONFIG_MBEDTLS_2_X
+static int dtls_srtp_key_derivation_cb(void* context,
+                                       const unsigned char* ms,
+                                       const unsigned char* kb,
+                                       size_t maclen,
+                                       size_t keylen,
+                                       size_t ivlen,
+                                       const unsigned char client_random[32],
+                                       const unsigned char server_random[32],
+                                       mbedtls_tls_prf_types tls_prf_type) {
+#else
+static void dtls_srtp_key_derivation_cb(void* context,
+                                        mbedtls_ssl_key_export_type secret_type,
+                                        const unsigned char* secret,
+                                        size_t secret_len,
+                                        const unsigned char client_random[32],
+                                        const unsigned char server_random[32],
+                                        mbedtls_tls_prf_types tls_prf_type) {
+#endif
+  DtlsSrtp* dtls_srtp = (DtlsSrtp*)context;
+
+  unsigned char master_secret[48];
+  unsigned char randbytes[64];
+
+  memcpy(randbytes, client_random, 32);
+  memcpy(randbytes + 32, server_random, 32);
+
+#if CONFIG_MBEDTLS_2_X
+  memcpy(master_secret, ms, sizeof(master_secret));
+  return dtls_srtp_key_derivation(dtls_srtp, master_secret, sizeof(master_secret), randbytes, sizeof(randbytes), tls_prf_type);
+#else
+  memcpy(master_secret, secret, sizeof(master_secret));
+  dtls_srtp_key_derivation(dtls_srtp, master_secret, sizeof(master_secret), randbytes, sizeof(randbytes), tls_prf_type);
+#endif
+}
+
+static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
+  int ret;
+
+  static mbedtls_timing_delay_context timer;
+
+  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+
+#if CONFIG_MBEDTLS_2_X
+  mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
+#else
+  mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
+#endif
+
+  mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+
+  do {
+    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
+
+  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+
+  return ret;
+}
+
+static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
+  int ret;
+
+  while (1) {
+    unsigned char client_ip[] = "test";
+
+    ret = mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+    if (ret != 0) {
+      LOGE("mbedtls_ssl_session_reset failed -0x%.4x", (unsigned int)-ret);
+      break;
+    }
+
+    ret = mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
+    if (ret != 0) {
+      LOGE("mbedtls_ssl_set_client_transport_id failed -0x%.4x", (unsigned int)-ret);
+      break;
+    }
+
+    ret = dtls_srtp_do_handshake(dtls_srtp);
+
+    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
+      LOGD("DTLS hello verification requested");
+
+    } else if (ret != 0) {
+      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
+
+      break;
+
+    } else {
+      break;
+    }
+  }
+
+  LOGD("DTLS server handshake done");
+
+  return ret;
+}
+
+static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
+  int ret;
+
+  ret = dtls_srtp_do_handshake(dtls_srtp);
+  if (ret != 0) {
+    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
+  }
+
+  LOGD("DTLS client handshake done");
+
+  return ret;
+}
+
+int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr, const char* remote_fingerprint) {
+  int ret;
+  dtls_srtp->remote_addr = addr;
+  if (dtls_srtp->state != DTLS_SRTP_STATE_INIT) {
+    LOGE("DTLS-SRTP already initialized");
+    return -1;
+  }
+
+  if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    ret = dtls_srtp_handshake_server(dtls_srtp);
+  } else {
+    ret = dtls_srtp_handshake_client(dtls_srtp);
+  }
+
+  if (ret != 0) {
+    return ret;
+  }
+
+  const mbedtls_x509_crt* remote_crt;
+  if ((remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl)) != NULL) {
+    dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
+
+    if (strncmp(remote_fingerprint, dtls_srtp->actual_remote_fingerprint,
+                DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
+      LOGE("Actual and Expected Fingerprint mismatch: %s %s",
+           remote_fingerprint,
+           dtls_srtp->actual_remote_fingerprint);
+      return -1;
+    }
+
+  } else {
+    LOGE("no remote fingerprint");
+    return -1;
+  }
+
+  dtls_srtp->state = DTLS_SRTP_STATE_CONNECTED;
+
+  mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
+  mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
+
+  return ret;
+}
+
+int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
+  int ret;
+
+  do {
+    ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
+
+  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  return ret;
+}
+
+int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
+  int ret;
+
+  memset(buf, 0, len);
+
+  do {
+    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
+
+  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+
+  return ret;
+}
+
+int dtls_srtp_probe(uint8_t* buf) {
+  if (buf == NULL)
+    return 0;
+
+  LOGD("DTLS content type: %d", buf[0]);
+  // only handle application data
+  return (buf[0] == 0x17);
+}
+
+/* libsrtp3（esp_libsrtp）收发分离签名：protect/unprotect 需独立的输入
+ * 与输出缓冲及长度指针；原地处理时用临时容量足够的工作区中转。 */
+void dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
+  uint8_t out[CONFIG_MTU];
+  size_t out_len = sizeof(out);
+  if (srtp_unprotect(dtls_srtp->srtp_in, packet, (size_t)*bytes, out, &out_len) ==
+      srtp_err_status_ok) {
+    memcpy(packet, out, out_len);
+    *bytes = (int)out_len;
+  } else {
+    *bytes = 0;
+  }
+}
+
+void dtls_srtp_decrypt_rtcp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
+  uint8_t out[CONFIG_MTU];
+  size_t out_len = sizeof(out);
+  if (srtp_unprotect_rtcp(dtls_srtp->srtp_in, packet, (size_t)*bytes, out, &out_len) ==
+      srtp_err_status_ok) {
+    memcpy(packet, out, out_len);
+    *bytes = (int)out_len;
+  } else {
+    *bytes = 0;
+  }
+}
+
+int dtls_srtp_encrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
+  uint8_t out[CONFIG_MTU];
+  size_t out_len = sizeof(out);
+  if (srtp_protect(dtls_srtp->srtp_out, packet, (size_t)*bytes, out, &out_len, 0) !=
+      srtp_err_status_ok) {
+    return -1;
+  }
+  memcpy(packet, out, out_len);
+  *bytes = (int)out_len;
+  return 0;
+}
+
+void dtls_srtp_encrypt_rctp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
+  uint8_t out[CONFIG_MTU];
+  size_t out_len = sizeof(out);
+  if (srtp_protect_rtcp(dtls_srtp->srtp_out, packet, (size_t)*bytes, out, &out_len, 0) ==
+      srtp_err_status_ok) {
+    memcpy(packet, out, out_len);
+    *bytes = (int)out_len;
+  }
+}

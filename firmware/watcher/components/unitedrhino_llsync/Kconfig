@@ -1,0 +1,7 @@
+menu "UnitedRhino LLSync"
+config UNITEDRHINO_LLSYNC_SUPPORT
+
+    bool "UnitedRhino LLSync support."
+    default "y"
+
+endmenu

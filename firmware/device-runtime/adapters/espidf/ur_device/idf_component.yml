@@ -1,0 +1,3 @@
+# 与原Watcher使用相同固定JSON组件版本；没有硬件或网络驱动依赖。
+dependencies:
+  espressif/cjson: "1.7.19~2"

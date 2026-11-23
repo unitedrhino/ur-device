@@ -1,0 +1,7 @@
+menu "UnitedRhino Iot C"
+config UNITEDRHINO_IOT_C_SDK
+
+    bool "UnitedRhino Iot C SDK."
+    default "y"
+
+endmenu
